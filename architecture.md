@@ -1,4 +1,4 @@
-# Arquitectura: GHL Sentinel (MVP Interno) — v2
+# Arquitectura: GHL Guardian (MVP Interno) — v2
 
 > **Decisión**: Next.js Full-Stack + Supabase (Opción A)
 > **Fecha original**: 2026-07-21 · **Actualizado**: 2026-07-22
@@ -52,18 +52,18 @@ Stack del brief original. **Descartada** por Leo: dos codebases agregan overhead
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  GHL Sentinel (Next.js App)                                  │
+│  GHL Guardian (Next.js App)                                  │
 │                                                              │
 │  ┌─────────────┐  ┌──────────────────┐  ┌───────────────┐  │
-│  │  Dashboard   │  │  API Routes      │  │  Cron Jobs    │  │
-│  │  (React SPA) │  │  /api/sentinel/* │  │  (Vercel Cron)│  │
+│  │  (React SPA) │  │  API Routes      │  │  Cron Jobs    │  │
+│  │              │  │  /api/guardian/* │  │  (Vercel Cron)│  │
 │  └──────┬───────┘  └────────┬─────────┘  └───────┬───────┘  │
 │         │                   │                     │          │
 │         └───────────────────┼─────────────────────┘          │
 │                             │                                │
 │                    ┌────────┴────────┐                       │
 │                    │   Health Engine │                       │
-│                    │  (src/lib/core) │                       │
+│                    │  (src/use-cases)│                       │
 │                    └────────┬────────┘                       │
 │                             │                                │
 │         ┌───────────────────┼───────────────────┐           │
@@ -82,7 +82,7 @@ Stack del brief original. **Descartada** por Leo: dos codebases agregan overhead
 
 **Nota sobre "GHL Client" (agregada en esta revisión):** este componente ya no asume un token único de larga vida por subcuenta. Internamente contiene un **Agency Token Manager** que guarda el PIT de agencia (estático, sin refresh automático) y lo intercambia on-demand por un location token de corta duración cada vez que el Health Engine necesita chequear una subcuenta puntual, cacheando ese location token en memoria con TTL corto. Ver sección 4.4 y ADR-006.
 
-**Nota sobre "Auth (Supabase)":** este es el login de los operadores humanos al *dashboard de Sentinel* — es un sistema de autenticación completamente separado del token de agencia de GHL. No hay que confundir "loguearse a Sentinel" con "loguearse a GHL"; son dos capas de auth distintas.
+**Nota sobre "Auth (Supabase)":** este es el login de los operadores humanos al *dashboard de Guardian* — es un sistema de autenticación completamente separado del token de agencia de GHL. No hay que confundir "loguearse a Guardian" con "loguearse a GHL"; son dos capas de auth distintas.
 
 ---
 
@@ -121,7 +121,7 @@ src/
 │   │   └── oauth-strategies/        # Una estrategia por proveedor
 │   │       ├── oauth-strategy.ts    # Interfaz común
 │   │       ├── google-calendar.ts   # Detecta respuestas sospechosas (200 con items:[])
-│   │       └── facebook.ts          # Estrategia específica de Facebook
+│   │       └── facebook.ts          # v2 — no incluido en MVP (ADR-002: un módulo por proveedor)
 │   ├── monitors/               # Implementaciones de HealthCheck por servicio
 │   │   ├── workflow-monitor.ts
 │   │   ├── oauth-monitor.ts
@@ -154,11 +154,11 @@ src/
 │       └── (componentes de wacrm: ui/*, tremor/*, etc.)
 │
 ├── app/
-│   ├── (dashboard)/sentinel/        # Rutas del dashboard
+│   ├── (dashboard)/guardian/        # Rutas del dashboard
 │   │   ├── page.tsx                 # → DashboardPage
 │   │   ├── config/page.tsx          # → ConfigPage
 │   │   └── subaccounts/page.tsx     # → SubaccountManager
-│   └── api/sentinel/
+│   └── api/guardian/
 │       ├── webhook/route.ts         # POST — recibe webhooks de GHL
 │       ├── health/route.ts          # GET — dashboard state
 │       ├── health/[subaccountId]/route.ts  # GET — detalle por subcuenta
@@ -284,7 +284,7 @@ No hay "login por subcuenta": el operador humano nunca ve ni gestiona 80+ creden
 ### 5.1 Dashboard State
 
 ```
-GET /api/sentinel/health
+GET /api/guardian/health
 Response 200:
 {
   "clients": [                                    // NUEVO — rollup por cliente real
@@ -324,7 +324,7 @@ Response 200:
 ### 5.2 Detalle por Subcuenta
 
 ```
-GET /api/sentinel/health/{subaccountId}
+GET /api/guardian/health/{subaccountId}
 Response 200:
 {
   "subaccount": { ..., "clientId": "client_xyz", "clientName": "Cliente A" },
@@ -351,7 +351,7 @@ Response 200:
 ### 5.3 Webhook Receiver
 
 ```
-POST /api/sentinel/webhook
+POST /api/guardian/webhook
 Headers: X-GHL-Signature: {hmac_sha256}
 Body:
 {
@@ -370,7 +370,7 @@ Response 429: Rate limited
 ### 5.4 Configuración
 
 ```
-GET /api/sentinel/config
+GET /api/guardian/config
 Response 200:
 {
   "subaccounts": [...],
@@ -382,7 +382,7 @@ Response 200:
   }
 }
 
-PUT /api/sentinel/config
+PUT /api/guardian/config
 Body: { ... }   // Actualiza timeouts/baselines
 Response 200: { "updated": true }
 ```
@@ -471,7 +471,8 @@ SELECT DISTINCT ON (subaccount_id, service)
 FROM health_events
 ORDER BY subaccount_id, service, created_at DESC;
 
--- Refresh cada vez que se insertan eventos (o cada 1 min via cron)
+-- La vista se refresca desde run-all-checks.ts al final de cada ciclo de cron.
+-- NO usar trigger AFTER INSERT — ver tasks.md Task 0.3.
 CREATE UNIQUE INDEX idx_current_health ON current_health (subaccount_id, service);
 ```
 
@@ -583,11 +584,11 @@ CREATE TABLE agency_config (
 
 **Opciones**:
 1. **Upgrade a Vercel Pro** (US$20/mes/usuario) — mantiene todo el código igual, cron nativo cada minuto.
-2. **Scheduler externo** (GitHub Actions con cron schedule, o servicio tipo cron-job.org) que llama por HTTP a `GET /api/sentinel/cron` — sin costo adicional de Vercel, pero agrega una dependencia externa y un secreto compartido (`CRON_SECRET`) para proteger el endpoint.
+2. **Scheduler externo** (GitHub Actions con cron schedule, o servicio tipo cron-job.org) que llama por HTTP a `GET /api/guardian/cron` — sin costo adicional de Vercel, pero agrega una dependencia externa y un secreto compartido (`CRON_SECRET`) para proteger el endpoint.
 
 **Decisión**: pendiente — a definir antes de Fase 7 (Cron Jobs + Deploy). No bloquea el desarrollo de las Fases 1-6, que no dependen del mecanismo de disparo.
 
-**Consecuencias**: si se elige la opción externa, el endpoint `/api/sentinel/cron` debe diseñarse igual (idempotente, protegido por secreto) independientemente de quién lo dispare — esto ya está contemplado en la sección 8.
+**Consecuencias**: si se elige la opción externa, el endpoint `/api/guardian/cron` debe diseñarse igual (idempotente, protegido por secreto) independientemente de quién lo dispare — esto ya está contemplado en la sección 8.
 
 ---
 
@@ -597,8 +598,8 @@ CREATE TABLE agency_config (
 
 | Entorno | Rama | URL | DB |
 |---|---|---|---|
-| **dev** | `develop` | `sentinel-dev.vercel.app` | Supabase dev project |
-| **prod** | `main` | `sentinel.wacrm.tech` (o dominio propio) | Supabase prod project |
+| **dev** | `develop` | `guardian-dev.vercel.app` | Supabase dev project |
+| **prod** | `main` | `guardian.wacrm.tech` (o dominio propio) | Supabase prod project |
 
 ### CI/CD
 
@@ -623,7 +624,7 @@ GHL_API_BASE_URL=https://services.leadconnectorhq.com   # CORREGIDO — no rest.
 GHL_WEBHOOK_SECRET=    # HMAC shared secret
 
 # Cron
-CRON_SECRET=           # Para proteger GET /api/sentinel/cron, sea Vercel Cron o scheduler externo
+CRON_SECRET=           # Para proteger GET /api/guardian/cron, sea Vercel Cron o scheduler externo
 ```
 
 ---
@@ -647,7 +648,7 @@ CRON_SECRET=           # Para proteger GET /api/sentinel/cron, sea Vercel Cron o
 ## 10. Critical Points (para monitoreo operativo futuro)
 
 ```yaml
-client: ghl-sentinel-internal
+client: ghl-guardian-internal
 critical_points:
   - id: CP-001
     name: health_check_cron
@@ -707,7 +708,7 @@ critical_points:
 
 ## 11. Tests Esperados (TDD de Pipeline)
 
-### Contrato: GET /api/sentinel/health
+### Contrato: GET /api/guardian/health
 
 | # | Caso | Setup | HTTP Esperado | Body Esperado |
 |---|---|---|---|---|
@@ -716,14 +717,15 @@ critical_points:
 | T03 | Subcuenta sin eventos | 1 subcuenta, 0 health_events | 200 | services con status "unknown", score null |
 | T14 | Rollup por cliente *(NUEVO)* | Cliente con 3 subcuentas, 1 con incidente | 200 | `clients[x].hasIncident = true`, aunque 2/3 subcuentas estén healthy |
 
-### Contrato: POST /api/sentinel/webhook
+### Contrato: POST /api/guardian/webhook
 
 | # | Caso | Input | HTTP Esperado | Body Esperado |
 |---|---|---|---|---|
 | T04 | Webhook workflow.started válido | HMAC correcto, payload workflow.started | 200 | { received: true, eventId: "..." } |
 | T05 | Firma inválida | HMAC incorrecto | 401 | { error: "invalid_signature" } |
 | T06 | Evento desconocido | event: "unknown.event" | 400 | { error: "unknown_event_type" } |
-| T07 | Rate limit | >100 req en 10s desde misma IP | 429 | { error: "rate_limited" } |
+| T07 | Rate limit por location | >100 req en 10s para misma location | 429 | { error: "rate_limited" } |
+| — | *(Nota: el límite real de GHL es por location, no por IP. Rate-limitar el webhook receiver por subaccountId tiene sentido de negocio: evita que una sola subcuenta ruidosa sature el ingestion.)* |
 
 ### Health Engine: WorkflowMonitor
 

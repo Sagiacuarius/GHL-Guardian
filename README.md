@@ -1,4 +1,4 @@
-# GHL Sentinel
+# GHL Guardian
 
 Plataforma de observabilidad para GoHighLevel — monitoreo proactivo de subcuentas.
 

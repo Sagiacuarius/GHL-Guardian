@@ -24,7 +24,7 @@
 
 ```bash
 # Desde /home/leonardo/projects
-npx create-next-app@latest ghl-guardian --typescript --tailwind --eslint --app --src-dir --no-import-alias
+npx create-next-app@latest ghl-guardian --typescript --tailwind --eslint --app --src-dir --import-alias "@/*"
 cd ghl-guardian
 npm install @supabase/ssr @supabase/supabase-js class-variance-authority clsx date-fns lucide-react recharts sonner tailwind-merge tw-animate-css
 npm install -D vitest @types/node prettier prettier-plugin-tailwindcss
@@ -120,11 +120,13 @@ FROM health_events
 ORDER BY subaccount_id, service, created_at DESC;
 CREATE UNIQUE INDEX idx_current_health ON current_health (subaccount_id, service);
 
--- Refresh function
-CREATE OR REPLACE FUNCTION refresh_current_health() RETURNS trigger AS $$
+-- La vista se refresca desde run-all-checks.ts al final de cada ciclo de cron,
+-- NO desde un trigger por fila (un REFRESH MATERIALIZED VIEW CONCURRENTLY en un trigger
+-- AFTER INSERT bloquearía cada escritura del Event Store).
+CREATE OR REPLACE FUNCTION refresh_current_health()
+RETURNS void AS $$
 BEGIN
   REFRESH MATERIALIZED VIEW CONCURRENTLY current_health;
-  RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 ```
@@ -142,8 +144,8 @@ $$ LANGUAGE plpgsql;
 
 **Steps:**
 1. Leer `GHL_AGENCY_PIT` y `GHL_COMPANY_ID` de `.env.local`
-2. Llamar a `GET https://services.leadconnectorhq.com/locations/search?companyId={COMPANY_ID}` con header `Authorization: Bearer {PIT}`
-3. Parsear respuesta, agrupar por cliente (heurística: nombre de location contiene nombre de cliente)
+2. Llamar a `GET https://services.leadconnectorhq.com/locations/search?companyId={COMPANY_ID}&limit=100` con header `Authorization: Bearer {PIT}`. **Manejar paginación:** si la respuesta incluye `next` o `offset`, iterar hasta consumir todas las páginas. Con 300+ subcuentas, el límite default puede no devolver todos los resultados.
+3. Parsear respuesta. Agrupar por cliente usando heurística de nombre. **Locations sin match claro se reportan como "sin asignar" para revisión manual** — no se asigna cliente automáticamente si hay ambigüedad.
 4. Insertar en `clients` + `subaccounts`
 5. Imprimir resumen: N clientes, N subcuentas
 
@@ -321,6 +323,38 @@ git commit -m "feat(domain): value objects + entities (HealthStatus, Client, Sub
 - Crear: `src/domain/ports/agency-token-provider.ts`
 
 ```typescript
+// src/domain/ports/ghl-client.ts
+import type { HealthStatus } from '../value-objects/health-status';
+
+export interface WorkflowInfo {
+  id: string;
+  name: string;
+  status: 'active' | 'paused' | 'draft';
+  lastExecutionAt?: Date;
+}
+
+export interface OAuthIntegration {
+  id: string;
+  provider: string;
+  status: 'connected' | 'disconnected' | 'expired';
+  lastSyncAt?: Date;
+}
+
+export interface WhatsAppNumber {
+  id: string;
+  phoneNumber: string;
+  status: HealthStatus;
+  lastActivityAt?: Date;
+}
+
+export interface GHLClient {
+  getWorkflows(locationId: string, token: string): Promise<WorkflowInfo[]>;
+  getOAuthIntegrations(locationId: string, token: string): Promise<OAuthIntegration[]>;
+  getWhatsAppNumbers(locationId: string, token: string): Promise<WhatsAppNumber[]>;
+}
+```
+
+```typescript
 // src/domain/ports/health-check.ts
 import type { HealthStatus } from '../value-objects/health-status';
 import type { ServiceType } from '../value-objects/service-type';
@@ -393,9 +427,7 @@ describe('AgencyTokenManager', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    manager = new AgencyTokenManager('pit_test123', 'company_xyz', 'https://services.leadconnectorhq.com');
-    // Inject mock fetch
-    (manager as any).fetchFn = mockFetch;
+    manager = new AgencyTokenManager('pit_test123', 'company_xyz', 'https://services.leadconnectorhq.com', mockFetch);
   });
 
   it('intercambia PIT por location token exitosamente', async () => {
@@ -448,8 +480,9 @@ export class AgencyTokenManager implements AgencyTokenProvider {
     private readonly pit: string,
     private readonly companyId: string,
     private readonly baseUrl: string,
+    fetchFn: typeof fetch = fetch,
   ) {
-    this.fetchFn = fetch;
+    this.fetchFn = fetchFn;
   }
 
   async getLocationToken(locationId: string): Promise<{ token: string; expiresAt: Date }> {
@@ -459,9 +492,15 @@ export class AgencyTokenManager implements AgencyTokenProvider {
     }
 
     const response = await this.fetchFn(
-      `${this.baseUrl}/oauth/locationToken?companyId=${this.companyId}&locationId=${locationId}`,
+      `${this.baseUrl}/oauth/locationToken`,
       {
-        headers: { Authorization: `Bearer ${this.pit}`, 'Content-Type': 'application/json' },
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.pit}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Version: '2021-07-28',
+        },
+        body: new URLSearchParams({ companyId: this.companyId, locationId }),
       },
     );
 
@@ -480,6 +519,8 @@ export class AgencyTokenManager implements AgencyTokenProvider {
   }
 
   async listLocations(): Promise<{ locationId: string; name: string }[]> {
+    // NOTA: si la agencia tiene 300+ locations, este endpoint puede paginar.
+    // Implementar iteración sobre páginas (next/offset) si la respuesta lo requiere.
     const response = await this.fetchFn(
       `${this.baseUrl}/locations/search?companyId=${this.companyId}`,
       { headers: { Authorization: `Bearer ${this.pit}` } },
@@ -499,6 +540,10 @@ export class AgencyTokenManager implements AgencyTokenProvider {
 git add src/adapters/ghl/agency-token-manager*
 git commit -m "feat(adapters): AgencyTokenManager — PIT + location token exchange con cache"
 ```
+
+> ⚠️ **Pre-flight check:** Antes de escribir el código, verificar que el PIT tenga el scope `oauth.write` en el dropdown de GHL (`Settings → Private Integrations`). Varios usuarios de la comunidad reportan que este scope no siempre aparece, y sin él el endpoint `/oauth/locationToken` devuelve 401 persistente aunque el código sea correcto.
+>
+> ⚠️ **Tabla `agency_config` — solo metadata:** La tabla `agency_config` (creada en Task 0.3) almacena `company_id`, `scopes_granted`, `last_verified_at` — SOLO metadata operativa para el dashboard (ej. "PIT verificado hace 3 días"). **El valor del PIT nunca se persiste en esta tabla ni en ninguna otra** — vive exclusivamente en `GHL_AGENCY_PIT` (variable de entorno). Task 2.2 debe leer `agency_config` para exponer `last_verified_at` y `scopes_granted` en el dashboard, pero nunca escribir el secreto.
 
 ---
 
@@ -521,6 +566,9 @@ export class RateLimiter {
   }
 
   async acquire(locationId: string): Promise<void> {
+    // NOTA: buckets crece sin límite por diseño. En MVP con ~400 subcuentas + serverless
+    // (instancia nueva por invocación), la memoria no es problema. Si se migra a un
+    // proceso long-running, agregar evicción LRU con TTL.
     let bucket = this.buckets.get(locationId);
     const now = Date.now();
 
@@ -567,6 +615,8 @@ export class RateLimiter {
 
 **Verification:** Tests con mock de fetch para cada endpoint, respetando rate limiter.
 
+> ⚠️ **Fail-fast:** Al inicializarse, `AgencyTokenManager` debe validar que `GHL_AGENCY_PIT` esté definida y no vacía. Si falta, lanzar error explícito al inicio (no en runtime durante el primer health check).
+
 ---
 
 ## Fase 3: Monitores — Workflow + Webhook
@@ -593,22 +643,27 @@ export class RateLimiter {
 
 **Objective:** Endpoint que recibe webhooks de GHL, valida HMAC, persiste HealthEvent.
 
+> ⚠️ **Deduplicación:** GHL puede enviar webhooks duplicados. Usar el `eventId` del payload como idempotency key — verificar si ya existe un `health_event` con ese `eventId` antes de insertar.
+
 **Files:**
-- Crear: `src/app/api/sentinel/webhook/route.ts`
-- Crear: `src/app/api/sentinel/webhook/route.test.ts`
+- Crear: `src/app/api/guardian/webhook/route.ts`
+- Crear: `src/app/api/guardian/webhook/route.test.ts`
 - Crear: `src/adapters/webhook/ghl-webhook-handler.ts`
 
 **Test cases:** T04, T05, T06, T07 de architecture.md §11.
 
 ---
 
-### Task 3.3: Supabase Event Store
+### Task 3.3: Supabase Event Store + Repos
 
-**Objective:** Implementar EventStore con Supabase JS Client.
+**Objective:** Implementar EventStore + repositorios de dominio con Supabase JS Client.
 
 **Files:**
 - Crear: `src/adapters/supabase/event-store.ts`
 - Crear: `src/adapters/supabase/event-store.test.ts`
+- Crear: `src/adapters/supabase/client-repo.ts`
+- Crear: `src/adapters/supabase/subaccount-repo.ts`
+- Crear: `src/adapters/supabase/config-repo.ts`
 
 ---
 
@@ -630,11 +685,13 @@ export class RateLimiter {
 - Crear: `src/adapters/monitors/oauth-monitor.ts`
 - Crear: `src/adapters/monitors/oauth-monitor.test.ts`
 
-### Task 4.3: EmailMonitor + PhoneMonitor
+### Task 4.3: EmailMonitor + PhoneMonitor (stub)
 
 **Files:**
 - Crear: `src/adapters/monitors/email-monitor.ts`
 - Crear: `src/adapters/monitors/phone-monitor.ts`
+
+**Alcance MVP:** EmailMonitor se implementa completo (webhook LCEmailStats). PhoneMonitor es un **stub** que devuelve `HealthStatus.Unknown` — la heurística de silencio requiere baseline de datos reales que no existen en MVP. Se completa en v2.
 
 ---
 
@@ -643,6 +700,10 @@ export class RateLimiter {
 ### Task 5.1: Run Health Check (orquestador principal)
 
 **Objective:** `run-all-checks.ts` itera subcuentas × monitores, respetando rate limits.
+
+> ⚠️ **Idempotencia:** Si una ejecución del cron tarda más que el intervalo configurado, dos instancias podrían solaparse. Agregar un lock simple (ej. flag en `agency_config` o `SELECT ... FOR UPDATE`) para prevenir ejecuciones concurrentes.
+>
+> ⚠️ **Cache en serverless:** El `Map` de location tokens (`AgencyTokenManager`) y los buckets del `RateLimiter` solo sobreviven dentro de una misma invocación del cron. En Vercel (serverless) no hay garantía de reúso de instancia entre ticks de 5 minutos. Esto no rompe nada porque `run-all-checks.ts` itera todas las subcuentas dentro de una sola invocación, pero el cache **no ahorra** llamadas entre ciclos — solo evita intercambios repetidos dentro del mismo ciclo.
 
 **Files:**
 - Crear: `src/use-cases/run-health-check.ts`
@@ -668,10 +729,10 @@ export class RateLimiter {
 ### Task 6.1: API Routes
 
 **Files:**
-- Crear: `src/app/api/sentinel/cron/route.ts`
-- Crear: `src/app/api/sentinel/health/route.ts`
-- Crear: `src/app/api/sentinel/health/[subaccountId]/route.ts`
-- Crear: `src/app/api/sentinel/config/route.ts`
+- Crear: `src/app/api/guardian/cron/route.ts`
+- Crear: `src/app/api/guardian/health/route.ts`
+- Crear: `src/app/api/guardian/health/[subaccountId]/route.ts`
+- Crear: `src/app/api/guardian/config/route.ts`
 
 ### Task 6.2: Dashboard UI — Layout + Navegación
 
@@ -695,8 +756,8 @@ export class RateLimiter {
 **Files:**
 - Crear: `src/ui/config/monitor-config-form.tsx`
 - Crear: `src/ui/config/subaccount-manager.tsx`
-- Crear: `src/app/(dashboard)/sentinel/config/page.tsx`
-- Crear: `src/app/(dashboard)/sentinel/subaccounts/page.tsx`
+- Crear: `src/app/(dashboard)/guardian/config/page.tsx`
+- Crear: `src/app/(dashboard)/guardian/subaccounts/page.tsx`
 
 ---
 
@@ -746,10 +807,11 @@ src/
 ├── ui/
 │   ├── dashboard/         (6 archivos)
 │   ├── config/            (2 archivos)
-│   └── layout/            (2 archivos)
+│   ├── layout/            (2 archivos)
+│   └── shared/            (componentes de wacrm: ui/*)
 ├── app/
-│   ├── (dashboard)/sentinel/  (3 page.tsx)
-│   └── api/sentinel/          (5 route.ts + 1 test)
+│   ├── (dashboard)/guardian/  (3 page.tsx)
+│   └── api/guardian/          (5 route.ts + 1 test)
 ├── lib/
 │   └── supabase/          (2 archivos)
 └── scripts/               (1 seed script)
